@@ -281,13 +281,42 @@ func PollImmediateInfinite(interval time.Duration, condition ConditionFunc) erro
 	return PollInfinite(interval, condition)
 }
 
+// cancelFunc will signal users of an associated channel
+// to abandon their work.
+// It is safe to call multiple times.
+type cancelFunc func()
+
+// cancelChan creates a channel cancellable via the returned cancelFunc.
+// It is safe to call cancelFunc multiple times - the channel
+// will be closed once to signal its receivers.
+func cancelChan() (chan struct{}, cancelFunc) {
+	var once sync.Once
+	ch := make(chan struct{})
+	return ch, func() {
+		once.Do(func() {
+			close(ch)
+		})
+	}
+}
+
 // PollUntil tries a condition func until it returns true, an error or stopCh is
 // closed.
 //
 // PollUntil always waits interval before the first run of 'condition'.
 // 'condition' will always be invoked at least once.
 func PollUntil(interval time.Duration, condition ConditionFunc, stopCh <-chan struct{}) error {
-	return WaitFor(poller(interval, 0), condition, stopCh)
+	done, cancel := cancelChan()
+	defer cancel()
+
+	go func() {
+		select {
+		case <-stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	return WaitFor(poller(interval, 0), condition, done)
 }
 
 // PollImmediateUntil tries a condition func until it returns true, an error or stopCh is closed.
@@ -346,7 +375,9 @@ func WaitFor(wait WaitFunc, fn ConditionFunc, done <-chan struct{}) error {
 // timeout has elapsed and then closes the channel.
 //
 // Over very short intervals you may receive no ticks before the channel is
-// closed. A timeout of 0 is interpreted as an infinity.
+// closed. A timeout of 0 is interpreted as an infinity, and in such a case
+// it would be the caller's responsibility to close the done channel.
+// Failure to do so would result in a leaked goroutine.
 //
 // Output ticks are not buffered. If the channel is not ready to receive an
 // item, the tick is skipped.
